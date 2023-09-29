@@ -2,13 +2,16 @@ import { collections } from "$lib/server/database";
 import { ObjectId } from "mongodb";
 import { error } from "@sveltejs/kit";
 import { authCondition } from "$lib/server/auth";
+import { UrlDependency } from "$lib/types/UrlDependency";
 
-export const load = async ({ params, locals }) => {
+export const load = async ({ params, depends, locals }) => {
 	// todo: add validation on params.id
 	const conversation = await collections.conversations.findOne({
 		_id: new ObjectId(params.id),
 		...authCondition(locals),
 	});
+
+	depends(UrlDependency.Conversation);
 
 	if (!conversation) {
 		const conversationExists =

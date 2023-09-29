@@ -4,7 +4,6 @@
 	import { pendingMessageIdToRetry } from "$lib/stores/pendingMessageIdToRetry";
 	import { onMount } from "svelte";
 	import { page } from "$app/stores";
-	import { textGenerationStream, type Options } from "@huggingface/inference";
 	import { invalidate } from "$app/navigation";
 	import { base } from "$app/paths";
 	import { shareConversation } from "$lib/shareConversation";
@@ -12,13 +11,18 @@
 	import { ERROR_MESSAGES, error } from "$lib/stores/errors";
 	import { randomUUID } from "$lib/utils/randomUuid";
 	import { findCurrentModel } from "$lib/utils/models";
+	import { webSearchParameters } from "$lib/stores/webSearchParameters";
 	import type { Message } from "$lib/types/Message";
+	import { PUBLIC_APP_DISCLAIMER } from "$env/static/public";
+	import type { MessageUpdate, WebSearchUpdate } from "$lib/types/MessageUpdate";
 
 	export let data;
 
 	let messages = data.messages;
 	let lastLoadedMessages = data.messages;
 	let isAborted = false;
+
+	let webSearchMessages: WebSearchUpdate[] = [];
 
 	// Since we modify the messages array locally, we don't want to reset it if an old version is passed
 	$: if (data.messages !== lastLoadedMessages) {
@@ -28,85 +32,9 @@
 
 	let loading = false;
 	let pending = false;
+	let loginRequired = false;
 
-	async function getTextGenerationStream(inputs: string, messageId: string, isRetry = false) {
-		const conversationId = $page.params.id;
-		const responseId = randomUUID();
-
-		const response = textGenerationStream(
-			{
-				model: $page.url.href,
-				inputs,
-				parameters: {
-					...data.models.find((m) => m.id === data.model)?.parameters,
-					return_full_text: false,
-				},
-			},
-			{
-				id: messageId,
-				response_id: responseId,
-				is_retry: isRetry,
-				use_cache: false,
-			} as Options
-		);
-
-		for await (const output of response) {
-			pending = false;
-
-			if (!output) {
-				break;
-			}
-
-			if (conversationId !== $page.params.id) {
-				fetch(`${base}/conversation/${conversationId}/stop-generating`, {
-					method: "POST",
-				}).catch(console.error);
-				break;
-			}
-
-			if (isAborted) {
-				isAborted = false;
-				fetch(`${base}/conversation/${conversationId}/stop-generating`, {
-					method: "POST",
-				}).catch(console.error);
-				break;
-			}
-
-			// final message
-			if (output.generated_text) {
-				const lastMessage = messages[messages.length - 1];
-
-				if (lastMessage) {
-					lastMessage.content = output.generated_text;
-					messages = [...messages];
-				}
-				break;
-			}
-
-			if (!output.token.special) {
-				const lastMessage = messages[messages.length - 1];
-
-				if (lastMessage?.from !== "assistant") {
-					// First token has a space at the beginning, trim it
-					messages = [
-						...messages,
-						// id doesn't match the backend id but it's not important for assistant messages
-						{ from: "assistant", content: output.token.text.trimStart(), id: responseId },
-					];
-				} else {
-					lastMessage.content += output.token.text;
-					messages = [...messages];
-				}
-			}
-		}
-	}
-
-	async function summarizeTitle(id: string) {
-		await fetch(`${base}/conversation/${id}/summarize`, {
-			method: "POST",
-		});
-	}
-
+	// this function is used to send new message to the backends
 	async function writeMessage(message: string, messageId = randomUUID()) {
 		if (!message.trim()) return;
 
@@ -115,29 +43,109 @@
 			loading = true;
 			pending = true;
 
+			// first we check if the messageId already exists, indicating a retry
+
 			let retryMessageIndex = messages.findIndex((msg) => msg.id === messageId);
 			const isRetry = retryMessageIndex !== -1;
+			// if it's not a retry we just use the whole array
 			if (!isRetry) {
 				retryMessageIndex = messages.length;
 			}
 
+			// slice up to the point of the retry
 			messages = [
 				...messages.slice(0, retryMessageIndex),
 				{ from: "user", content: message, id: messageId },
 			];
 
-			await getTextGenerationStream(message, messageId, isRetry);
+			const responseId = randomUUID();
 
-			if (messages.filter((m) => m.from === "user").length === 1) {
-				summarizeTitle($page.params.id)
-					.then(() => invalidate(UrlDependency.ConversationList))
-					.catch(console.error);
-			} else {
-				await invalidate(UrlDependency.ConversationList);
+			const response = await fetch(`${base}/conversation/${$page.params.id}`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					inputs: message,
+					id: messageId,
+					response_id: responseId,
+					is_retry: isRetry,
+					web_search: $webSearchParameters.useSearch,
+				}),
+			});
+
+			if (!response.body) {
+				throw new Error("Body not defined");
 			}
+
+			// eslint-disable-next-line no-undef
+			const encoder = new TextDecoderStream();
+			const reader = response?.body?.pipeThrough(encoder).getReader();
+			let finalAnswer = "";
+
+			// this is a bit ugly
+			// we read the stream until we get the final answer
+			while (finalAnswer === "") {
+				// await new Promise((r) => setTimeout(r, 25));
+
+				// check for abort
+				if (isAborted) {
+					reader?.cancel();
+					break;
+				}
+
+				// if there is something to read
+				await reader?.read().then(async ({ done, value }) => {
+					// we read, if it's done we cancel
+					if (done) {
+						reader.cancel();
+						return;
+					}
+
+					if (!value) {
+						return;
+					}
+
+					// if it's not done we parse the value, which contains all messages
+					const inputs = value.split("\n");
+					inputs.forEach((el: string) => {
+						try {
+							let update = JSON.parse(el) as MessageUpdate;
+							if (update.type === "finalAnswer") {
+								finalAnswer = update.text;
+								invalidate(UrlDependency.Conversation);
+							} else if (update.type === "stream") {
+								pending = false;
+
+								let lastMessage = messages[messages.length - 1];
+
+								if (lastMessage.from !== "assistant") {
+									messages = [
+										...messages,
+										{ from: "assistant", id: randomUUID(), content: update.token },
+									];
+								} else {
+									lastMessage.content += update.token;
+									messages = [...messages];
+								}
+							} else if (update.type === "webSearch") {
+								webSearchMessages = [...webSearchMessages, update];
+							}
+						} catch (parseError) {
+							// in case of parsing error we wait for the next message
+							return;
+						}
+					});
+				});
+			}
+
+			// reset the websearchmessages
+			webSearchMessages = [];
+
+			await invalidate(UrlDependency.ConversationList);
 		} catch (err) {
 			if (err instanceof Error && err.message.includes("overloaded")) {
 				$error = "Too much traffic, please try again.";
+			} else if (err instanceof Error && err.message.includes("429")) {
+				$error = ERROR_MESSAGES.rateLimited;
 			} else if (err instanceof Error) {
 				$error = err.message;
 			} else {
@@ -186,18 +194,31 @@
 			writeMessage(val, messageId);
 		}
 	});
-
+	$: $page.params.id, (isAborted = true);
 	$: title = data.conversations.find((conv) => conv.id === $page.params.id)?.title ?? data.title;
+
+	$: loginRequired =
+		(data.requiresLogin
+			? !data.user
+			: !data.settings.ethicsModalAcceptedAt && !!PUBLIC_APP_DISCLAIMER) &&
+		messages.length >= data.messagesBeforeLogin;
 </script>
 
 <svelte:head>
 	<title>{title}</title>
+	<link
+		rel="stylesheet"
+		href="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.css"
+		integrity="sha384-GvrOXuhMATgEsSwCs4smul74iXGOixntILdUW9XmUC6+HX0sLNAK3q71HotJqlAn"
+		crossorigin="anonymous"
+	/>
 </svelte:head>
 
 <ChatWindow
 	{loading}
 	{pending}
 	{messages}
+	bind:webSearchMessages
 	on:message={(event) => writeMessage(event.detail)}
 	on:retry={(event) => writeMessage(event.detail.content, event.detail.id)}
 	on:vote={(event) => voteMessage(event.detail.score, event.detail.id)}
@@ -206,4 +227,5 @@
 	models={data.models}
 	currentModel={findCurrentModel([...data.models, ...data.oldModels], data.model)}
 	settings={data.settings}
+	{loginRequired}
 />

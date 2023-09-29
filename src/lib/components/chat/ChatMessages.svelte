@@ -8,6 +8,8 @@
 	import type { LayoutData } from "../../../routes/$types";
 	import ChatIntroduction from "./ChatIntroduction.svelte";
 	import ChatMessage from "./ChatMessage.svelte";
+	import type { WebSearchUpdate } from "$lib/types/MessageUpdate";
+	import { browser } from "$app/environment";
 
 	export let messages: Message[];
 	export let loading: boolean;
@@ -20,20 +22,22 @@
 
 	let chatContainer: HTMLElement;
 
+	export let webSearchMessages: WebSearchUpdate[] = [];
+
 	async function scrollToBottom() {
 		await tick();
 		chatContainer.scrollTop = chatContainer.scrollHeight;
 	}
 
 	// If last message is from user, scroll to bottom
-	$: if (messages[messages.length - 1]?.from === "user") {
+	$: if (browser && messages[messages.length - 1]?.from === "user") {
 		scrollToBottom();
 	}
 </script>
 
 <div
 	class="scrollbar-custom mr-1 h-full overflow-y-auto"
-	use:snapScrollToBottom={messages.length ? messages : false}
+	use:snapScrollToBottom={messages.length ? [...messages, ...webSearchMessages] : false}
 	bind:this={chatContainer}
 >
 	<div class="mx-auto flex h-full max-w-3xl flex-col gap-6 px-5 pt-6 sm:gap-8 xl:max-w-4xl">
@@ -44,6 +48,7 @@
 				{isAuthor}
 				{readOnly}
 				model={currentModel}
+				webSearchMessages={i === messages.length - 1 ? webSearchMessages : []}
 				on:retry
 				on:vote
 			/>
@@ -54,9 +59,10 @@
 			<ChatMessage
 				message={{ from: "assistant", content: "", id: randomUUID() }}
 				model={currentModel}
+				{webSearchMessages}
 			/>
 		{/if}
-		<div class="h-36 flex-none" />
+		<div class="h-44 flex-none" />
 	</div>
 	<ScrollToBottomBtn
 		class="bottom-36 right-4 max-md:hidden lg:right-10"

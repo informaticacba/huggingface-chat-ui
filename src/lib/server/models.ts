@@ -1,5 +1,41 @@
 import { HF_ACCESS_TOKEN, MODELS, OLD_MODELS } from "$env/static/private";
+import type { ChatTemplateInput, WebSearchQueryTemplateInput } from "$lib/types/Template";
+import { compileTemplate } from "$lib/utils/template";
 import { z } from "zod";
+
+type Optional<T, K extends keyof T> = Pick<Partial<T>, K> & Omit<T, K>;
+
+const sagemakerEndpoint = z.object({
+	host: z.literal("sagemaker"),
+	url: z.string().url(),
+	accessKey: z.string().min(1),
+	secretKey: z.string().min(1),
+	sessionToken: z.string().optional(),
+});
+
+const tgiEndpoint = z.object({
+	host: z.union([z.literal("tgi"), z.undefined()]),
+	url: z.string().url(),
+	authorization: z.string().min(1).default(`Bearer ${HF_ACCESS_TOKEN}`),
+});
+
+const commonEndpoint = z.object({
+	weight: z.number().int().positive().default(1),
+});
+
+const endpoint = z.lazy(() =>
+	z.union([sagemakerEndpoint.merge(commonEndpoint), tgiEndpoint.merge(commonEndpoint)])
+);
+
+const combinedEndpoint = endpoint.transform((data) => {
+	if (data.host === "tgi" || data.host === undefined) {
+		return tgiEndpoint.merge(commonEndpoint).parse(data);
+	} else if (data.host === "sagemaker") {
+		return sagemakerEndpoint.merge(commonEndpoint).parse(data);
+	} else {
+		throw new Error(`Invalid host: ${data.host}`);
+	}
+});
 
 const modelsRaw = z
 	.array(
@@ -11,12 +47,35 @@ const modelsRaw = z
 			displayName: z.string().min(1).optional(),
 			description: z.string().min(1).optional(),
 			websiteUrl: z.string().url().optional(),
+			modelUrl: z.string().url().optional(),
 			datasetName: z.string().min(1).optional(),
-			userMessageToken: z.string().min(1),
-			assistantMessageToken: z.string().min(1),
-			messageEndToken: z.string().min(1).optional(),
+			datasetUrl: z.string().url().optional(),
+			userMessageToken: z.string().default(""),
+			userMessageEndToken: z.string().default(""),
+			assistantMessageToken: z.string().default(""),
+			assistantMessageEndToken: z.string().default(""),
+			messageEndToken: z.string().default(""),
 			preprompt: z.string().default(""),
 			prepromptUrl: z.string().url().optional(),
+			chatPromptTemplate: z
+				.string()
+				.default(
+					"{{preprompt}}" +
+						"{{#each messages}}" +
+						"{{#ifUser}}{{@root.userMessageToken}}{{content}}{{@root.userMessageEndToken}}{{/ifUser}}" +
+						"{{#ifAssistant}}{{@root.assistantMessageToken}}{{content}}{{@root.assistantMessageEndToken}}{{/ifAssistant}}" +
+						"{{/each}}" +
+						"{{assistantMessageToken}}"
+				),
+			webSearchQueryPromptTemplate: z
+				.string()
+				.default(
+					"{{userMessageToken}}" +
+						'My question is: "{{message.content}}". ' +
+						"Based on the conversation history (my previous questions are: {{previousMessages}}), give me an appropriate query to answer my question for google search. You should not say more than query. You should not say any words except the query. For the context, today is {{currentDate}}" +
+						"{{userMessageEndToken}}" +
+						"{{assistantMessageToken}}"
+				),
 			promptExamples: z
 				.array(
 					z.object({
@@ -25,15 +84,7 @@ const modelsRaw = z
 					})
 				)
 				.optional(),
-			endpoints: z
-				.array(
-					z.object({
-						url: z.string().url(),
-						authorization: z.string().min(1).default(`Bearer ${HF_ACCESS_TOKEN}`),
-						weight: z.number().int().positive().default(1),
-					})
-				)
-				.optional(),
+			endpoints: z.array(combinedEndpoint).optional(),
 			parameters: z
 				.object({
 					temperature: z.number().min(0).max(1),
@@ -50,6 +101,13 @@ const modelsRaw = z
 export const models = await Promise.all(
 	modelsRaw.map(async (m) => ({
 		...m,
+		userMessageEndToken: m?.userMessageEndToken || m?.messageEndToken,
+		assistantMessageEndToken: m?.assistantMessageEndToken || m?.messageEndToken,
+		chatPromptRender: compileTemplate<ChatTemplateInput>(m.chatPromptTemplate, m),
+		webSearchQueryPromptRender: compileTemplate<WebSearchQueryTemplateInput>(
+			m.webSearchQueryPromptTemplate,
+			m
+		),
 		id: m.id || m.name,
 		displayName: m.displayName || m.name,
 		preprompt: m.prepromptUrl ? await fetch(m.prepromptUrl).then((r) => r.text()) : m.preprompt,
@@ -70,7 +128,8 @@ export const oldModels = OLD_MODELS
 			.map((m) => ({ ...m, id: m.id || m.name, displayName: m.displayName || m.name }))
 	: [];
 
-export type BackendModel = (typeof models)[0];
+export type BackendModel = Optional<(typeof models)[0], "preprompt">;
+export type Endpoint = z.infer<typeof endpoint>;
 
 export const defaultModel = models[0];
 
